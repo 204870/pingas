@@ -11,16 +11,19 @@ audio grain per phoneme interval.  Grain boundaries mirror UTAU OTO concepts:
                  here: fixed look-back into the preceding phone
   overlap      – crossfade half-width shared with the next grain (seconds)
 
+Each grain also carries phonetic context (prev_phone, next_phone, word) so
+synth.py can do diphone/triphone-style context-aware selection, matching the
+classic concatenative approach but operating on arbitrary granular units.
+
 Grains are written to  grains/<PHONEME>/<index>.wav  (mono, 44100 Hz, int16).
 A JSON index  grains/index.json  lists every grain with its metadata.
 """
 
 import json
 import wave
-import struct
 import os
 import numpy as np
-import tgt
+from scipy.fft import dct
 import aligned_textgrid as atg
 
 # ---------------------------------------------------------------------------
@@ -36,6 +39,7 @@ OUT_DIR  = "grains"
 PREUTTERANCE = 0.02   # look-back before phone onset  (consonant lead-in)
 OVERLAP      = 0.015  # crossfade half-width at each boundary
 MIN_DURATION = 0.02   # skip phones shorter than this (alignment noise)
+FRAME_DUR    = 0.025  # MFCC analysis window width (seconds)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -73,6 +77,40 @@ def write_wav_mono(path: str, samples: np.ndarray, sr: int) -> None:
         wf.writeframes(pcm.tobytes())
 
 
+def _mel_filterbank(n_filters: int, n_fft: int, sr: int) -> np.ndarray:
+    """Return (n_filters, n_fft//2+1) triangular mel filterbank matrix."""
+    def hz_to_mel(hz): return 2595.0 * np.log10(1.0 + hz / 700.0)
+    def mel_to_hz(m):  return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+
+    lo   = hz_to_mel(80.0)
+    hi   = hz_to_mel(sr / 2.0)
+    bins = np.floor(
+        (n_fft + 1) * mel_to_hz(np.linspace(lo, hi, n_filters + 2)) / sr
+    ).astype(int)
+
+    n_bins = n_fft // 2 + 1
+    fb = np.zeros((n_filters, n_bins))
+    for m in range(1, n_filters + 1):
+        lo_b, mid_b, hi_b = bins[m - 1], bins[m], bins[m + 1]
+        rise = max(mid_b - lo_b, 1)
+        fall = max(hi_b - mid_b, 1)
+        fb[m - 1, lo_b:mid_b] = (np.arange(lo_b, mid_b) - lo_b) / rise
+        fb[m - 1, mid_b:hi_b] = (hi_b - np.arange(mid_b, hi_b)) / fall
+    return fb
+
+
+def compute_mfcc(samples: np.ndarray, sr: int, n_mfcc: int = 13, n_mel: int = 26) -> np.ndarray:
+    """Return n_mfcc-dimensional MFCC vector for a short audio frame."""
+    if len(samples) < 8:
+        return np.zeros(n_mfcc)
+    n_fft    = max(512, 1 << int(np.ceil(np.log2(len(samples)))))
+    emph     = np.append(samples[0], samples[1:] - 0.97 * samples[:-1])
+    windowed = emph * np.hanning(len(emph))
+    power    = np.abs(np.fft.rfft(windowed, n=n_fft)) ** 2
+    log_mel  = np.log(_mel_filterbank(n_mel, n_fft, sr) @ power + 1e-8)
+    return dct(log_mel, type=2, norm="ortho")[:n_mfcc]
+
+
 def hann_fade(samples: np.ndarray, fade_len: int) -> np.ndarray:
     """Apply a Hann fade-in and fade-out of `fade_len` samples."""
     out = samples.copy()
@@ -101,13 +139,8 @@ def main() -> None:
         textgrid_path=TG_PATH,
         entry_classes=[atg.Word, atg.Phone],
     )
-    group      = tg[0]
-    words_tier = group[0]   # "words" IntervalTier
-    phones_tier = group[1]  # "phones" IntervalTier
-
-    # -- also open with tgt for flat phone iteration -------------------------
-    tg_flat = tgt.io.read_textgrid(TG_PATH)
-    flat_phones = tg_flat.get_tier_by_name("phones").intervals  # list[Interval]
+    group       = tg[0]
+    phones_tier = group[1]  # "phones" IntervalTier (Phone SequenceIntervals)
 
     # -- extract grains ------------------------------------------------------
     index   = []   # list of grain metadata dicts
@@ -115,24 +148,49 @@ def main() -> None:
 
     fade_samples = max(1, int(OVERLAP * sr))
 
-    for interval in flat_phones:
-        label = interval.text.strip()
+    for phone in phones_tier:
+        label = phone.label.strip()
         if not label:
             continue  # skip silence/empty
 
-        duration = interval.end_time - interval.start_time
+        duration = phone.end - phone.start
         if duration < MIN_DURATION:
             continue
 
+        # atg gives us .prev and .fol for neighbouring phones in the sequence;
+        # boundary objects have empty labels, which we normalise to None.
+        prev_label = phone.prev.label.strip() or None
+        next_label = phone.fol.label.strip()  or None
+
+        # parent word via the hierarchical containment link
+        word_label = getattr(phone.within, "label", "").strip() or None
+
         # OTO-style boundaries (clamped to audio extent)
-        offset_sec  = max(0.0,       interval.start_time - PREUTTERANCE)
-        cutoff_sec  = min(total_dur, interval.end_time   + OVERLAP)
+        offset_sec  = max(0.0,       phone.start - PREUTTERANCE)
+        cutoff_sec  = min(total_dur, phone.end   + OVERLAP)
 
         offset_samp = int(offset_sec * sr)
         cutoff_samp = int(cutoff_sec * sr)
 
-        grain = audio[offset_samp:cutoff_samp]
-        grain = hann_fade(grain, fade_samples)
+        raw_grain = audio[offset_samp:cutoff_samp]
+
+        # MFCC snapshots at join boundaries, taken from raw audio before fading
+        # so the spectral content isn't distorted by the envelope shaping.
+        # entry = frame at the phone onset (where the preceding grain hands off)
+        # exit  = frame at the phone end (where the following grain picks up)
+        half_frame     = int(FRAME_DUR * sr) // 2
+        onset_samp     = int(PREUTTERANCE * sr)               # within grain
+        phone_end_samp = int((phone.end - offset_sec) * sr)   # within grain
+
+        entry_lo = max(0, onset_samp - half_frame)
+        entry_hi = min(len(raw_grain), onset_samp + half_frame)
+        mfcc_entry = compute_mfcc(raw_grain[entry_lo:entry_hi], sr).tolist()
+
+        exit_lo = max(0, phone_end_samp - half_frame)
+        exit_hi = min(len(raw_grain), phone_end_samp + half_frame)
+        mfcc_exit = compute_mfcc(raw_grain[exit_lo:exit_hi], sr).tolist()
+
+        grain = hann_fade(raw_grain, fade_samples)
 
         # write grain file
         phoneme_dir = os.path.join(OUT_DIR, label)
@@ -143,14 +201,19 @@ def main() -> None:
 
         index.append({
             "phoneme":       label,
+            "prev_phone":    prev_label,
+            "next_phone":    next_label,
+            "word":          word_label,
             "path":          grain_path,
             "offset":        offset_sec,
             "cutoff":        cutoff_sec,
             "preutterance":  PREUTTERANCE,
             "overlap":       OVERLAP,
             "duration":      duration,
-            "source_start":  interval.start_time,
-            "source_end":    interval.end_time,
+            "source_start":  phone.start,
+            "source_end":    phone.end,
+            "mfcc_entry":    mfcc_entry,
+            "mfcc_exit":     mfcc_exit,
         })
 
     # -- write index ---------------------------------------------------------
