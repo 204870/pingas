@@ -37,6 +37,7 @@ import os
 import random
 import wave
 import numpy as np
+from scipy.signal import butter, sosfilt
 import aligned_textgrid as atg
 from g2p import text_to_phones
 
@@ -163,7 +164,7 @@ def _select_by_cost(
 def select_grain(
     mono: dict[str, list[dict]],
     phoneme: str,
-    strategy: str = "random",
+    strategy: str = "cost",
     target_dur: float | None = None,
     prev_phone: str | None = None,
     next_phone: str | None = None,
@@ -341,6 +342,10 @@ def main() -> None:
 
     # -- overlap-add concat --------------------------------------------------
     result = ola_concat(grain_arrays, overlap_samp)
+
+    # -- high-pass filter (100 Hz, 8th-order Butterworth = -48 dB/oct) -------
+    sos    = butter(8, 100.0, btype="high", fs=sr, output="sos")
+    result = sosfilt(sos, result)
 
     # -- write output --------------------------------------------------------
     write_wav_mono(args.out, result, sr)
