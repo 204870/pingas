@@ -34,6 +34,7 @@ Usage examples
 import argparse
 import json
 import os
+import re
 import random
 import wave
 import numpy as np
@@ -51,10 +52,12 @@ OUT_WAV     = "out_synth.wav"
 # ---------------------------------------------------------------------------
 # H&B-style cost weights
 # ---------------------------------------------------------------------------
-W_TARGET   = 1.0   # weight for phonetic context mismatch  (range 0–1)
-W_JOIN     = 1.0   # weight for spectral join cost
-MFCC_SCALE = 20.0  # normalising divisor for MFCC Euclidean distance
+W_TARGET      = 1.0   # weight for phonetic context mismatch  (range 0–1)
+W_JOIN        = 1.0   # weight for spectral join cost
+MFCC_SCALE    = 20.0  # normalising divisor for MFCC Euclidean distance
                #   ~5–15 = within-class variation; ~20–40 = cross-class
+STRESS_WEIGHT = 0.5   # penalty for vowel stress mismatch (autosegmental prominence)
+               #   0 = exact, 0.5 = adjacent level (1↔2 or 0↔1), 1.0 = max (0↔2)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -119,11 +122,50 @@ def load_index(path: str) -> tuple[dict, dict]:
 
 
 # ---------------------------------------------------------------------------
+# Stress / prominence helpers  (autosegmental-metrical theory)
+# ---------------------------------------------------------------------------
+
+def _is_vowel(phoneme: str) -> bool:
+    """True if phoneme carries an ARPAbet stress digit, i.e. is a vowel."""
+    return bool(re.search(r"[0-9]", phoneme))
+
+
+def _vowel_stress(phoneme: str) -> int:
+    """Return ARPAbet stress digit (0/1/2). Call only after _is_vowel check."""
+    return int(re.search(r"[0-9]", phoneme).group())
+
+
+def _stress_cost(target_ph: str, candidate_ph: str) -> float:
+    """
+    Metrical prominence penalty: distance on the stress scale, normalised to [0, 1].
+    0 = exact match or consonant, 0.5 = adjacent level, 1.0 = max mismatch (0↔2).
+    """
+    if not _is_vowel(target_ph) or not _is_vowel(candidate_ph):
+        return 0.0
+    return abs(_vowel_stress(target_ph) - _vowel_stress(candidate_ph)) / 2.0
+
+
+def _expanded_candidates(mono: dict, phoneme: str) -> list[dict]:
+    """
+    For vowels, pool all stress-level variants of the same base phoneme.
+    For consonants (no stress digit), return the exact entry only.
+    """
+    if not _is_vowel(phoneme):
+        return mono.get(phoneme, [])
+    base = re.sub(r"[0-9]", "", phoneme)
+    candidates: list[dict] = []
+    for stress in ("0", "1", "2"):
+        candidates.extend(mono.get(base + stress, []))
+    return candidates
+
+
+# ---------------------------------------------------------------------------
 # Grain selection strategies
 # ---------------------------------------------------------------------------
 
 def _select_by_cost(
     candidates: list[dict],
+    target_phoneme: str,
     prev_phone: str | None,
     next_phone: str | None,
     prev_mfcc_exit: np.ndarray | None,
@@ -134,7 +176,7 @@ def _select_by_cost(
 
     target_cost  — phonetic context mismatch (0 = perfect triphone,
                    0.5 = one neighbour wrong, 1.0 = neither matches)
-                   plus an optional duration penalty.
+                   plus stress prominence penalty and optional duration penalty.
     join_cost    — normalised MFCC Euclidean distance between the exit
                    frame of the previous grain and the entry frame of
                    this candidate (0 when no previous grain exists).
@@ -144,6 +186,9 @@ def _select_by_cost(
         ctx = sum([g.get("prev_phone") == prev_phone,
                    g.get("next_phone") == next_phone])
         t_cost = (2 - ctx) / 2
+
+        # stress prominence penalty (AM theory): 0 = exact, 0.5 = adjacent, 1.0 = max
+        t_cost += STRESS_WEIGHT * _stress_cost(target_phoneme, g["phoneme"])
 
         # optional duration penalty, normalised to ~0–1
         if target_dur is not None:
