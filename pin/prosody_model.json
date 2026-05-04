@@ -1,0 +1,27 @@
+{
+  "f0_delta_stats": {
+    "std_cents": 347.17648191730257
+  },
+  "intensity_delta_stats": {
+    "std": 640.5684183706231
+  },
+  "feature_names": [
+    "is_vowel",
+    "is_voiced",
+    "stressed",
+    "prominent",
+    "boundary",
+    "boundary_rising",
+    "phrase_position"
+  ],
+  "target_names": [
+    "f0_delta_cents",
+    "intensity_delta_norm"
+  ],
+  "sequence_length": 200,
+  "f0_unit": "cents (delta from previous phone)",
+  "f0_bounds_hz": {
+    "min": 50.0,
+    "max": 600.0
+  }
+}

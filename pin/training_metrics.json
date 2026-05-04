@@ -1,0 +1,14 @@
+{
+  "test_metrics": {
+    "f0_delta_mae_cents": 201.9203643798828,
+    "f0_delta_rmse_cents": 316.50640869140625,
+    "f0_delta_mae_semitones": 2.0192036628723145,
+    "intensity_delta_mae": 0.8465794324874878,
+    "n_samples": 8912
+  },
+  "training_history": {
+    "final_train_loss": 32322.376953125,
+    "final_val_loss": 37246.7578125,
+    "epochs_trained": 51
+  }
+}
