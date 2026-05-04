@@ -99,7 +99,7 @@ VOWEL_RATIOS = {
 }
 
 # How strongly to pull toward target ratios (0=none, 1=full snap)
-FORMANT_TARGETING_STRENGTH = 0.1
+FORMANT_TARGETING_STRENGTH = 0.15
 
 # LPC parameters
 LPC_ORDER = 16
@@ -480,6 +480,7 @@ class ProsodyMarkers:
     prominent: bool = False      # * before word
     boundary: bool = False       # . ? ! after word
     boundary_rising: bool = False  # ? = rising, . ! = falling
+    pause_after: bool = False    # . , — insert silence after word
 
 
 def parse_prosodic_text(text: str) -> list[ProsodyMarkers]:
@@ -502,6 +503,7 @@ def parse_prosodic_text(text: str) -> list[ProsodyMarkers]:
         prominent = False
         boundary = False
         boundary_rising = False
+        pause_after = False
 
         # Check for prominence marker at start
         if token.startswith('*'):
@@ -512,16 +514,23 @@ def parse_prosodic_text(text: str) -> list[ProsodyMarkers]:
         if token.endswith('.'):
             boundary = True
             boundary_rising = False
+            pause_after = True
             token = token[:-1]
         elif token.endswith('?'):
             boundary = True
             boundary_rising = True
+            pause_after = True
             token = token[:-1]
         elif token.endswith('!'):
             # Emphatic: prominence + falling boundary
             prominent = True
             boundary = True
             boundary_rising = False
+            pause_after = True
+            token = token[:-1]
+        elif token.endswith(','):
+            # Comma: pause but no pitch accent
+            pause_after = True
             token = token[:-1]
 
         if token:  # Skip empty tokens
@@ -529,7 +538,8 @@ def parse_prosodic_text(text: str) -> list[ProsodyMarkers]:
                 word=token,
                 prominent=prominent,
                 boundary=boundary,
-                boundary_rising=boundary_rising
+                boundary_rising=boundary_rising,
+                pause_after=pause_after
             ))
 
     return result
@@ -1110,17 +1120,19 @@ def main() -> None:
                         help="Target grain durations in seconds, space-separated")
     parser.add_argument("--strategy", choices=["random", "longest", "shortest", "nearest", "cost"],
                         default="cost", help="Grain selection strategy (default: cost)")
-    parser.add_argument("--overlap", type=float, default=0.015,
-                        help="Crossfade half-width in seconds (default: 0.015)")
+    parser.add_argument("--overlap", type=float, default=0.040,
+                        help="Crossfade half-width in seconds (default: 0.040)")
     parser.add_argument("--out", type=str, default=OUT_WAV,
                         help=f"Output wav path (default: {OUT_WAV})")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--no-prosody", action="store_true",
                         help="Disable prosody modification (F0 changes)")
-    parser.add_argument("--lpc", action="store_true",
-                        help="Enable LPC resynthesis with formant smoothing")
-    parser.add_argument("--formant-strength", type=float, default=0.1,
-                        help="Formant targeting strength 0-1 (default: 0.1)")
+    parser.add_argument("--lpc", action="store_true", default=True,
+                        help="Enable LPC resynthesis with formant smoothing (default: on)")
+    parser.add_argument("--no-lpc", action="store_false", dest="lpc",
+                        help="Disable LPC resynthesis")
+    parser.add_argument("--formant-strength", type=float, default=0.15,
+                        help="Formant targeting strength (default: 0.15)")
     args = parser.parse_args()
 
     if not any([args.text, args.phones, args.word]):
@@ -1218,6 +1230,55 @@ def main() -> None:
     if not grain_arrays:
         print("No grains loaded — nothing to synthesise.")
         return
+
+    # -- insert silence after punctuation (. ? ! ,) --------------------------
+    if word_markers:
+        # Compute median vowel duration for silence length
+        vowel_durations = [
+            dur for phone, dur in zip(selected_phones, grain_durations)
+            if _is_vowel(phone)
+        ]
+        median_dur = float(np.median(vowel_durations)) if vowel_durations else 0.15
+        silence_samples = int(median_dur * sr)
+        silence = np.zeros(silence_samples, dtype=np.float64)
+
+        # Estimate word boundaries in phone list (same logic as assign_prosody_to_phones)
+        n_phones = len(selected_phones)
+        total_words = len(word_markers)
+        phones_per_word = n_phones // max(total_words, 1)
+
+        # Build new arrays with silence inserted
+        new_grains = []
+        new_phones = []
+        new_durations = []
+        phone_idx = 0
+
+        for wi, wm in enumerate(word_markers):
+            # Estimate phone range for this word
+            word_start = phone_idx
+            word_end = min(phone_idx + phones_per_word, n_phones)
+            if wi == len(word_markers) - 1:
+                word_end = n_phones  # last word gets remaining phones
+
+            # Add grains for this word
+            for pi in range(word_start, word_end):
+                if pi < len(grain_arrays):
+                    new_grains.append(grain_arrays[pi])
+                    new_phones.append(selected_phones[pi])
+                    new_durations.append(grain_durations[pi])
+
+            # Insert silence after word if pause_after
+            if wm.pause_after:
+                new_grains.append(silence)
+                new_phones.append("")  # empty phone for silence
+                new_durations.append(median_dur)
+                print(f"  [pause after '{wm.word}': {median_dur:.3f}s]")
+
+            phone_idx = word_end
+
+        grain_arrays = new_grains
+        selected_phones = new_phones
+        grain_durations = new_durations
 
     # -- overlap-add concat --------------------------------------------------
     if args.lpc and PARSELMOUTH_AVAILABLE:
